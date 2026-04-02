@@ -131,28 +131,48 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _bulletize(text: str) -> str:
+    """Convert plain-text lines into bullet format: '• Line 1\\n• Line 2'."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    result = []
+    for line in lines:
+        # Strip existing bullets/numbering
+        cleaned = re.sub(r"^[\d]+[.)]\s*", "", line)
+        cleaned = re.sub(r"^[•\-\*]\s*", "", cleaned)
+        if cleaned:
+            result.append(f"• {cleaned}")
+    return "\n".join(result) if result else text
+
+
 def parse_salary(
     salary_text: str,
-) -> Tuple[Optional[float], Optional[float], Optional[str], bool]:
+) -> Tuple[Optional[int], Optional[int], Optional[str], bool]:
     """Parse salary strings like 'KSh 60,000 - 75,000' or 'Confidential'."""
     if not salary_text or "confidential" in salary_text.lower():
         return None, None, None, False
 
-    currency_match = re.match(r"([A-Za-z$€£¥]+\$?)\s*", salary_text)
-    currency = currency_match.group(1).strip() if currency_match else None
+    # Normalize currency to ISO codes
+    currency = "KES"  # default for BrighterMonday Kenya
+    upper = salary_text.upper()
+    if "$" in salary_text or "USD" in upper:
+        currency = "USD"
+    elif "£" in salary_text or "GBP" in upper:
+        currency = "GBP"
+    elif "€" in salary_text or "EUR" in upper:
+        currency = "EUR"
 
     less_than = re.search(r"[Ll]ess\s+than\s+([\d,]+)", salary_text)
     if less_than:
-        max_val = float(less_than.group(1).replace(",", ""))
+        max_val = int(float(less_than.group(1).replace(",", "")))
         return None, max_val, currency, True
 
     range_match = re.findall(r"([\d,]+(?:\.\d+)?)", salary_text)
     if len(range_match) >= 2:
-        min_val = float(range_match[0].replace(",", ""))
-        max_val = float(range_match[1].replace(",", ""))
+        min_val = int(float(range_match[0].replace(",", "")))
+        max_val = int(float(range_match[1].replace(",", "")))
         return min_val, max_val, currency, True
     elif len(range_match) == 1:
-        val = float(range_match[0].replace(",", ""))
+        val = int(float(range_match[0].replace(",", "")))
         return val, val, currency, True
 
     return None, None, currency, bool(salary_text.strip())
@@ -314,11 +334,6 @@ class BrighterMondayScraper:
         self.max_pages = max_pages
         self.session = requests.Session()
         self.session.headers.update(REQUEST_HEADERS)
-        self._job_counter = 0
-
-    def _next_job_id(self) -> str:
-        self._job_counter += 1
-        return f"{BM_JOB_ID_PREFIX}-{self._job_counter:05d}"
 
     def _get_total_pages(self, soup: BeautifulSoup) -> int:
         """Extract the last page number from pagination links."""
@@ -448,7 +463,6 @@ class BrighterMondayScraper:
             return None
 
         job = JobListing()
-        job.job_id = self._next_job_id()
         job.source_platform = BM_SOURCE_PLATFORM
         job.source_url = url
         job.country = BM_COUNTRY
@@ -476,6 +490,11 @@ class BrighterMondayScraper:
             job.company = card_info.get("company", "")
         if not job.company or job.company.strip() == "":
             job.company = "Anonymous Employer"
+
+        # Generate deterministic job_id AFTER title and company are set
+        job.job_id = JobListing.generate_job_id(
+            job.title, job.company, prefix=BM_JOB_ID_PREFIX
+        )
 
         if len(h2_tags) >= 2:
             cat_h2 = h2_tags[1]
@@ -581,22 +600,40 @@ class BrighterMondayScraper:
                         job.application_deadline = deadline
 
         all_text = soup.get_text(" ", strip=True)
-        job.extracted_skills = extract_skills_from_text(all_text)
+        # extracted_skills left as None — backend generates these
+        job.extracted_skills = None
 
-        job.job_metadata = job.job_metadata or {}
-        job.job_metadata["slug"] = card_info.get(
-            "slug", url.rstrip("/").split("/")[-1]
-        )
-        job.job_metadata["easy_apply"] = "easy apply" in all_text.lower()
-        job.job_metadata["is_new"] = card_info.get("is_new", False)
+        # Build job_metadata with scraped_data wrapper for the backend
+        raw_scraped = {
+            "slug": card_info.get("slug", url.rstrip("/").split("/")[-1]),
+            "easy_apply": "easy apply" in all_text.lower(),
+            "is_new": card_info.get("is_new", False),
+            "card_tags": card_info.get("tags", []),
+            "card_summary": card_info.get("card_summary", ""),
+        }
+        if job.job_metadata and job.job_metadata.get("summary"):
+            raw_scraped["summary"] = job.job_metadata["summary"]
+        if job.job_metadata and job.job_metadata.get("industry"):
+            raw_scraped["industry"] = job.job_metadata["industry"]
+
+        metadata: Dict[str, Any] = {"scraped_data": raw_scraped}
 
         min_qual = self._find_label_value(soup, "Min Qualification")
         if min_qual:
-            job.job_metadata["min_qualification"] = min_qual
+            metadata["minimum_qualification"] = min_qual
 
         exp_level = self._find_label_value(soup, "Experience Level")
         if exp_level:
-            job.job_metadata["experience_level"] = exp_level
+            metadata["experience_level"] = exp_level
+
+        exp_length = self._find_label_value(soup, "Experience Length")
+        if exp_length:
+            metadata["experience_length"] = exp_length
+
+        if job.application_deadline:
+            metadata["deadline"] = job.application_deadline
+
+        job.job_metadata = metadata
 
         return job
 
@@ -636,7 +673,7 @@ class BrighterMondayScraper:
                 elif "hybrid" in tag_lower:
                     job.location_type = "hybrid"
                 else:
-                    job.location_type = "onsite"
+                    job.location_type = "on-site"
 
     def _parse_detail_tags(self, soup: BeautifulSoup, job: JobListing) -> None:
         """Parse tags from detail page (location, employment type, salary)."""
@@ -654,7 +691,7 @@ class BrighterMondayScraper:
                 if "remote" in job.specific_location.lower():
                     job.location_type = "remote"
                 else:
-                    job.location_type = "onsite"
+                    job.location_type = "on-site"
 
         if not job.employment_type:
             emp_link = soup.find(
@@ -772,11 +809,11 @@ class BrighterMondayScraper:
                 job.benefits = (job.benefits or "") + content.strip() + "\n"
 
         if job.responsibilities:
-            job.responsibilities = job.responsibilities.strip()
+            job.responsibilities = _bulletize(job.responsibilities.strip())
         if job.requirements:
-            job.requirements = job.requirements.strip()
+            job.requirements = _bulletize(job.requirements.strip())
         if job.benefits:
-            job.benefits = job.benefits.strip()
+            job.benefits = _bulletize(job.benefits.strip())
 
     def _split_into_sections_by_text(self, text: str) -> Dict[str, str]:
         """Split description text into sections based on heading patterns."""
@@ -935,6 +972,8 @@ Examples:
   python brightermonday_scraper.py --pages 10
   python brightermonday_scraper.py --pages all
   python brightermonday_scraper.py --pages 2 --output my_jobs.json
+  python brightermonday_scraper.py --pages 2 --db        # scrape + push to DB
+  python brightermonday_scraper.py --pages 2 --db --output my_jobs.json
         """,
     )
     parser.add_argument(
@@ -947,6 +986,12 @@ Examples:
         "-o",
         default=None,
         help="Output JSON file path (default: auto-generated timestamped file)",
+    )
+    parser.add_argument(
+        "--db",
+        action="store_true",
+        default=False,
+        help="Push scraped jobs to the production database",
     )
     args = parser.parse_args()
 
@@ -1002,6 +1047,28 @@ Examples:
     print(f"  With requirements  : {with_requirements}")
     print(f"  With benefits      : {with_benefits}")
     print("=" * 60)
+
+    # ── Push to database if --db flag is set ──
+    if args.db:
+        import asyncio
+        from db_storage import push_jobs_to_db, test_connection
+
+        print("\n" + "=" * 60)
+        print("  DATABASE PUSH")
+        print("=" * 60)
+
+        async def _push():
+            ok = await test_connection()
+            if not ok:
+                logger.error("Cannot connect to database. Skipping DB push.")
+                return
+            result = await push_jobs_to_db(jobs)
+            print(f"  Saved to DB       : {result['saved']}")
+            print(f"  Skipped (dupes)   : {result['skipped']}")
+            print(f"  Errors            : {result['errors']}")
+            print("=" * 60)
+
+        asyncio.run(_push())
 
 
 if __name__ == "__main__":

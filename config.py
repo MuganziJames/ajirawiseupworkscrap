@@ -52,8 +52,8 @@ DEFAULT_MAX_PAGES = 5
 # Country for BrighterMonday Kenya
 BM_COUNTRY = "Kenya"
 
-# Source platform name
-BM_SOURCE_PLATFORM = "brightermonday"
+# Source platform name (must match backend expectation)
+BM_SOURCE_PLATFORM = "BrighterMonday"
 
 # Job ID prefix
 BM_JOB_ID_PREFIX = "bm"
@@ -71,6 +71,16 @@ def get_output_filename(scraper_name: str, ext: str = "json") -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return os.path.join(OUTPUT_DIR, f"{scraper_name}_{ts}.{ext}")
 
+
+# ──────────────────────────────────────────────
+# Database Settings
+# ──────────────────────────────────────────────
+# Loaded from .env — async PostgreSQL connection string
+from dotenv import load_dotenv
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_ECHO = os.getenv("DATABASE_ECHO", "false").lower() == "true"
 
 # ──────────────────────────────────────────────
 # Logging

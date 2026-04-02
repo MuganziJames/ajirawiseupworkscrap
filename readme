@@ -1,0 +1,5 @@
+# Scrape only (JSON output)
+python brightermonday_scraper.py --pages 2
+
+# Scrape + push to production DB
+python brightermonday_scraper.py --pages 2 --db
