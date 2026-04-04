@@ -21,6 +21,7 @@ import json
 import logging
 import ssl
 import sys
+from uuid import uuid4
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +35,7 @@ from sqlalchemy import (
     Date,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSON, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSON, UUID, insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -150,9 +151,26 @@ def _parse_date(val: Optional[str]) -> Optional[date]:
     return None
 
 
+def _coerce_json(value: Any) -> Optional[Any]:
+    """Normalize values destined for JSON columns."""
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            # Keep plain strings as JSON string values.
+            return value
+    return value
+
+
 def job_to_db_dict(job: JobListing) -> Dict[str, Any]:
     """Convert a scraper JobListing dataclass to a dict for DB insertion."""
+    now = datetime.utcnow()
     return {
+        "id": str(uuid4()),
         "job_id": job.job_id,
         "title": job.title,
         "company": job.company,
@@ -186,7 +204,9 @@ def job_to_db_dict(job: JobListing) -> Dict[str, Any]:
         "application_count": job.application_count or 0,
         "extracted_skills": None,
         "ai_summary": None,
-        "job_metadata": job.job_metadata if job.job_metadata else None,
+        "job_metadata": _coerce_json(job.job_metadata),
+        "created_at": now,
+        "updated_at": now,
     }
 
 
@@ -266,16 +286,15 @@ async def push_jobs_to_db(jobs: List[JobListing]) -> Dict[str, int]:
             for job in jobs:
                 try:
                     db_dict = job_to_db_dict(job)
-                    # Use raw SQL for ON CONFLICT DO NOTHING
-                    columns = ", ".join(db_dict.keys())
-                    placeholders = ", ".join(f":{k}" for k in db_dict.keys())
-                    sql = text(
-                        f"INSERT INTO job_listings ({columns}) "
-                        f"VALUES ({placeholders}) "
-                        f"ON CONFLICT (job_id) DO NOTHING"
+                    stmt = (
+                        insert(JobListingDB)
+                        .values(**db_dict)
+                        .on_conflict_do_nothing(index_elements=[JobListingDB.job_id])
+                        .returning(JobListingDB.job_id)
                     )
-                    result = await session.execute(sql, db_dict)
-                    if result.rowcount > 0:
+                    result = await session.execute(stmt)
+                    inserted_job_id = result.scalar_one_or_none()
+                    if inserted_job_id:
                         saved += 1
                         logger.debug("  Saved: %s — %s", job.job_id, job.title[:40])
                     else:
@@ -283,6 +302,7 @@ async def push_jobs_to_db(jobs: List[JobListing]) -> Dict[str, int]:
                         logger.debug("  Skipped (duplicate): %s", job.job_id)
                 except Exception as exc:
                     errors += 1
+                    await session.rollback()
                     logger.error("  Error inserting %s: %s", job.job_id, exc)
 
             await session.commit()
